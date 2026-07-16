@@ -1,0 +1,12 @@
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+.env
+.env.*
+IDEA.md
+reports
+pgvector-index-manager
+*.test
+coverage.out

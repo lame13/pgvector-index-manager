@@ -1,0 +1,64 @@
+# Local project brief; intentionally not part of the Git repository.
+IDEA.md
+
+# Build and test output.
+/pgvector-index-manager
+/pgvector-index-manager.exe
+/bin/
+/build/
+/dist/
+/coverage/
+*.test
+*.out
+*.cov
+*.prof
+*.pprof
+*.trace
+*.coverprofile
+coverage.out
+/coverage.*
+/coverage.html
+/reports/
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+.envrc
+/.direnv/
+/config.yaml
+/config.local.yaml
+/config.*.local.yaml
+/config.override.yaml
+/docker/docker-compose.override.yml
+
+# Caches, logs, and temporary files.
+/.cache/
+/.gocache/
+/.tmp/
+/tmp/
+*.log
+*.pid
+*.sock
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local agent and editor state.
+/.agents/
+/.codex/
+/.idea/
+/.vscode/
+/.fleet/
+/.history/
+/.settings/
+*.iml
+.project
+.classpath
+
+# Operating systems.
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

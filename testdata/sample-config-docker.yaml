@@ -1,0 +1,41 @@
+# Docker Compose variant: connects to the "postgres" service hostname.
+# Use this config when running via `docker compose up`.
+
+connection:
+  dsn: "postgres://postgres:benchmark@postgres:5432/indexmanager"
+  statement_timeout: 30s
+  lock_timeout: 5s
+
+table:
+  schema: public
+  name: documents
+  vector_column: embedding
+
+index:
+  name: documents_embedding_idx
+  type: vector
+  metric: cosine
+  dimensions: 128
+  m: 16
+  ef_construction: 64
+
+population:
+  filters:
+    - column: status
+      values: ["active"]
+    - column: tier
+      values: ["standard"]
+
+reconcile:
+  ownership_tag: "pgvector-index-manager"
+  drop_unowned: false
+  build_timeout: 1h
+  grace_period: 0s
+  continuous: false
+  interval: 5m
+
+report:
+  output_dir: "/reports"
+  target_label: "docker-demo"
+  redact_connection: true
+  include_target_details: false

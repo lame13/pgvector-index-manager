@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg${POSTGRES_MAJOR:-16}
+    environment:
+      POSTGRES_PASSWORD: benchmark
+      POSTGRES_DB: indexmanager
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    # Demo data is intentionally ephemeral. A fresh cluster is initialized on
+    # every start, which also makes cross-version testing safe and reproducible.
+    tmpfs:
+      - /var/lib/postgresql
+    volumes:
+      - ../scripts/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ../scripts/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d indexmanager"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Status check: inspect current indexes (no changes made)
+  status:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../testdata:/config:ro
+      - ../reports:/reports
+    command: ["status", "-c", "/config/sample-config-docker.yaml"]
+
+  # Apply: create the desired index
+  apply:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../testdata:/config:ro
+      - ../reports:/reports
+    command: ["apply", "-c", "/config/sample-config-docker.yaml"]

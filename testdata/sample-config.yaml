@@ -1,0 +1,59 @@
+# pgvector-index-manager sample configuration
+#
+# Run against a local PostgreSQL instance with pgvector installed.
+
+connection:
+  dsn: "postgres://postgres:benchmark@localhost:5432/indexmanager"
+  statement_timeout: 30s
+  lock_timeout: 5s
+
+table:
+  schema: public
+  name: documents
+  vector_column: embedding
+
+index:
+  name: documents_embedding_idx
+  type: vector       # vector or halfvec
+  metric: cosine     # cosine, l2, ip
+  dimensions: 128    # required; vector max 2000, halfvec max 4000
+  m: 16              # HNSW m parameter (1-100)
+  ef_construction: 64  # HNSW ef_construction parameter (1-1000)
+
+# The index covers exactly this population. Remove filters to index the whole
+# table. Values are safely quoted and coerced to the filter column's type.
+population:
+  filters:
+    - column: status
+      values: ["active"]
+    - column: tier
+      values: ["standard"]
+
+reconcile:
+  # Ownership tag marks indexes created by this tool. Only indexes with this
+  # tag will be retired during reconciliation.
+  ownership_tag: "pgvector-index-manager"
+
+  # Controls whether a same-name index not created by this tool may be moved
+  # aside and retired during replacement. Other unowned indexes are preserved.
+  # Default: false (safe). Review `plan` before enabling.
+  drop_unowned: false
+
+  # Maximum time for a single index build. Default: 1h.
+  build_timeout: 1h
+
+  # Time to wait after building a replacement before retiring the old index.
+  # Default: 0s (immediate).
+  grace_period: 0s
+
+  # Enable continuous reconciliation mode.
+  continuous: false
+
+  # Polling interval in continuous mode. Default: 5m.
+  interval: 5m
+
+report:
+  output_dir: "./reports"
+  target_label: "local-demo"
+  redact_connection: true
+  include_target_details: false
