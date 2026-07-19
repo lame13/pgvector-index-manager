@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestApplyIntegrationRepairsDriftAndPreservesOtherPopulation(t *testing.T) {
 	}
 	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
 		config.QuoteIdentifier(schema), config.QuoteIdentifier(otherCfg.Index.Name),
-		config.QuoteLiteral(catalog.OwnershipComment(otherCfg)))
+		config.QuoteLiteral(catalog.OwnershipComment(otherCfg, inspectedIndex(t, pool, otherCfg, otherCfg.Index.Name))))
 	if _, err := pool.Exec(ctx, commentSQL); err != nil {
 		t.Fatalf("commenting other population index: %v", err)
 	}
@@ -132,7 +133,9 @@ func TestApplyIntegrationBlocksUnownedSameNameIndex(t *testing.T) {
 	}
 	retirementCommentSQL := fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
 		config.QuoteIdentifier(schema), config.QuoteIdentifier(interruptedRetirement),
-		config.QuoteLiteral(catalog.RetirementComment(cfg)))
+		config.QuoteLiteral(catalog.RetirementComment(
+			cfg, inspectedIndex(t, pool, cfg, interruptedRetirement), time.Now().Add(-time.Second), true,
+		)))
 	if _, err := pool.Exec(ctx, retirementCommentSQL); err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +145,173 @@ func TestApplyIntegrationBlocksUnownedSameNameIndex(t *testing.T) {
 	}
 	if len(result.Actions) != 1 || result.Actions[0].Kind != ActionRetire {
 		t.Fatalf("retirement recovery actions = %#v, want one retirement", result.Actions)
+	}
+}
+
+func TestApplyIntegrationBlocksCrossFamilyOwnership(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+	cfg := integrationConfig(schema, "documents_embedding_idx", "a")
+	cfg.Reconcile.DropUnowned = true
+	createSQL := fmt.Sprintf(
+		"CREATE INDEX %s ON %s.documents USING hnsw ((embedding::vector(3)) vector_cosine_ops) WHERE kind = 'a'",
+		config.QuoteIdentifier(cfg.Index.Name), config.QuoteIdentifier(schema),
+	)
+	if _, err := pool.Exec(ctx, createSQL); err != nil {
+		t.Fatal(err)
+	}
+	foreignCfg := integrationConfig(schema, "another_family_idx", "a")
+	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(cfg.Index.Name),
+		config.QuoteLiteral(catalog.OwnershipComment(foreignCfg, inspectedIndex(t, pool, cfg, cfg.Index.Name))))
+	if _, err := pool.Exec(ctx, commentSQL); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Apply(ctx, pool, cfg, false)
+	if !errors.Is(err, ErrManagedFamilyConflict) {
+		t.Fatalf("Apply() error = %v, want ErrManagedFamilyConflict", err)
+	}
+	if result == nil || !result.Failed || len(result.Actions) != 1 || result.Actions[0].Kind != ActionBlocked {
+		t.Fatalf("Apply() result = %#v, want one blocking action", result)
+	}
+	if !relationExists(t, pool, schema+"."+cfg.Index.Name) {
+		t.Fatal("Apply() removed an index owned by another managed family")
+	}
+}
+
+func TestApplyIntegrationHonorsDurableRetirementDeadline(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+	cfg := integrationConfig(schema, "documents_embedding_idx", "a")
+	if _, err := Apply(ctx, pool, cfg, false); err != nil {
+		t.Fatalf("initial Apply() error = %v", err)
+	}
+
+	const staleName = "documents_embedding_idx_retired_restart"
+	createSQL := fmt.Sprintf(
+		"CREATE INDEX %s ON %s.documents USING hnsw ((embedding::vector(3)) vector_cosine_ops) WHERE kind = 'a'",
+		config.QuoteIdentifier(staleName), config.QuoteIdentifier(schema),
+	)
+	if _, err := pool.Exec(ctx, createSQL); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(5 * time.Minute).UTC()
+	stale := inspectedIndex(t, pool, cfg, staleName)
+	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(staleName),
+		config.QuoteLiteral(catalog.RetirementComment(cfg, stale, future, false)))
+	if _, err := pool.Exec(ctx, commentSQL); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	result, err := Apply(waitCtx, pool, cfg, false)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Apply() error = %v, want deadline while grace remains", err)
+	}
+	if result == nil || !result.Failed {
+		t.Fatalf("Apply() result = %#v, want interrupted grace wait", result)
+	}
+	if !relationExists(t, pool, schema+"."+staleName) {
+		t.Fatal("restart recovery bypassed the durable grace deadline")
+	}
+
+	stale = inspectedIndex(t, pool, cfg, staleName)
+	commentSQL = fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(staleName),
+		config.QuoteLiteral(catalog.RetirementComment(cfg, stale, time.Now().Add(-time.Second), false)))
+	if _, err := pool.Exec(ctx, commentSQL); err != nil {
+		t.Fatal(err)
+	}
+	result, err = Apply(ctx, pool, cfg, false)
+	if err != nil {
+		t.Fatalf("eligible retirement Apply() error = %v", err)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].Kind != ActionRetire {
+		t.Fatalf("eligible retirement actions = %#v, want one retirement", result.Actions)
+	}
+}
+
+func TestApplyIntegrationDetectsStructuralReplacementUnderCopiedComment(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+	cfg := integrationConfig(schema, "documents_embedding_idx", "a")
+	if _, err := Apply(ctx, pool, cfg, false); err != nil {
+		t.Fatalf("initial Apply() error = %v", err)
+	}
+	original := inspectedIndex(t, pool, cfg, cfg.Index.Name)
+	if _, err := pool.Exec(ctx, fmt.Sprintf("DROP INDEX %s.%s",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(cfg.Index.Name))); err != nil {
+		t.Fatal(err)
+	}
+	createSQL := fmt.Sprintf(
+		"CREATE INDEX %s ON %s.documents USING hnsw ((embedding::vector(3)) vector_cosine_ops) WHERE kind = 'b'",
+		config.QuoteIdentifier(cfg.Index.Name), config.QuoteIdentifier(schema),
+	)
+	if _, err := pool.Exec(ctx, createSQL); err != nil {
+		t.Fatal(err)
+	}
+	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s.%s IS %s",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(cfg.Index.Name), config.QuoteLiteral(original.Comment))
+	if _, err := pool.Exec(ctx, commentSQL); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := catalog.Inspect(ctx, pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Drift || catalog.IndexMatchesSpec(*status.Desired(), cfg) {
+		t.Fatalf("copied ownership claim hid structural drift: %#v", status.Desired())
+	}
+	if !containsDriftReason(status.DriftReasons, "catalog structure differs") {
+		t.Fatalf("drift reasons = %v, want structural mismatch", status.DriftReasons)
+	}
+
+	result, err := Apply(ctx, pool, cfg, false)
+	if err != nil {
+		t.Fatalf("repair Apply() error = %v", err)
+	}
+	if len(result.Actions) != 3 {
+		t.Fatalf("repair actions = %#v, want build, publish, retire", result.Actions)
+	}
+}
+
+func TestApplyIntegrationBlocksNamespaceConflictBeforeBuild(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+	cfg := integrationConfig(schema, "documents_embedding_idx", "a")
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s.%s (id integer)",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(cfg.Index.Name))); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := catalog.Inspect(ctx, pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.NamespaceConflict != "a table" {
+		t.Fatalf("NamespaceConflict = %q, want a table", status.NamespaceConflict)
+	}
+	result, err := Apply(ctx, pool, cfg, false)
+	if !errors.Is(err, ErrNamespaceConflict) {
+		t.Fatalf("Apply() error = %v, want ErrNamespaceConflict", err)
+	}
+	if result == nil || len(result.Actions) != 1 || result.Actions[0].Kind != ActionBlocked {
+		t.Fatalf("Apply() result = %#v, want preflight block", result)
+	}
+	status, inspectErr := catalog.Inspect(ctx, pool, cfg)
+	if inspectErr != nil {
+		t.Fatal(inspectErr)
+	}
+	if len(status.Indexes) != 0 {
+		t.Fatalf("namespace preflight allowed build artifacts: %#v", status.Indexes)
 	}
 }
 
@@ -234,4 +404,37 @@ func integrationConfig(schema, indexName, kind string) *config.Config {
 			OwnershipTag: "pgvector-index-manager-test", BuildTimeout: "30s", GracePeriod: "0s",
 		},
 	}
+}
+
+func inspectedIndex(t *testing.T, pool *pgxpool.Pool, cfg *config.Config, name string) catalog.IndexInfo {
+	t.Helper()
+	status, err := catalog.Inspect(context.Background(), pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, idx := range status.Indexes {
+		if idx.Name == name {
+			return idx
+		}
+	}
+	t.Fatalf("index %s not found in %#v", name, status.Indexes)
+	return catalog.IndexInfo{}
+}
+
+func relationExists(t *testing.T, pool *pgxpool.Pool, qualifiedName string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), "SELECT to_regclass($1) IS NOT NULL", qualifiedName).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	return exists
+}
+
+func containsDriftReason(reasons []string, fragment string) bool {
+	for _, reason := range reasons {
+		if strings.Contains(reason, fragment) {
+			return true
+		}
+	}
+	return false
 }

@@ -2,13 +2,17 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lame13/pgvector-index-manager/internal/config"
@@ -19,13 +23,14 @@ const ownershipPrefix = "pgvector-index-manager:"
 
 // Status holds the current state of indexes for a table.
 type Status struct {
-	Table           string
-	VectorColumn    string
-	DesiredIndex    string
-	PGVectorVersion string
-	Indexes         []IndexInfo
-	Drift           bool
-	DriftReasons    []string
+	Table             string
+	VectorColumn      string
+	DesiredIndex      string
+	PGVectorVersion   string
+	NamespaceConflict string
+	Indexes           []IndexInfo
+	Drift             bool
+	DriftReasons      []string
 }
 
 // IndexInfo describes a single HNSW index on the target table.
@@ -38,15 +43,26 @@ type IndexInfo struct {
 	Ready                bool
 	Live                 bool
 	Owned                bool
+	Managed              bool
 	LegacyOwnership      bool
 	RetirementAuthorized bool
+	RetirementPending    bool
+	Owner                string
 	ManagedName          string
 	SpecHash             string
+	StructureHash        string
+	ActualStructureHash  string
+	RetireAfter          time.Time
 	IsDesired            bool
 	IsHealthy            bool
 	M                    int
 	EFConstruction       int
+	TotalColumns         int
+	KeyColumns           int
+	DirectColumn         string
+	IndexType            string
 	IndexExpression      string
+	ReferencedColumns    []string
 	Predicate            string
 	Definition           string
 	Comment              string
@@ -54,29 +70,36 @@ type IndexInfo struct {
 }
 
 type ownershipMetadata struct {
-	Version     int    `json:"version"`
-	State       string `json:"state,omitempty"`
-	Owner       string `json:"owner"`
-	ManagedName string `json:"managed_name"`
-	SpecHash    string `json:"spec_hash"`
+	Version       int    `json:"version"`
+	State         string `json:"state,omitempty"`
+	Owner         string `json:"owner"`
+	ManagedName   string `json:"managed_name"`
+	SpecHash      string `json:"spec_hash"`
+	StructureHash string `json:"structure_hash,omitempty"`
+	RetireAfter   string `json:"retire_after,omitempty"`
 }
 
 // OwnershipComment returns the durable marker written to a managed index.
-func OwnershipComment(cfg *config.Config) string {
+func OwnershipComment(cfg *config.Config, idx IndexInfo) string {
 	payload, _ := json.Marshal(ownershipMetadata{
-		Version: 1, State: "managed", Owner: cfg.Reconcile.OwnershipTag,
-		ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
+		Version: 2, State: "managed", Owner: cfg.Reconcile.OwnershipTag,
+		ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(), StructureHash: idx.ActualStructureHash,
 	})
 	return ownershipPrefix + string(payload)
 }
 
-// RetirementComment durably records that an originally unowned, same-name
-// index was explicitly authorized for retirement. This lets a later run finish
-// cleanup if the process stops after the atomic publication step.
-func RetirementComment(cfg *config.Config) string {
+// RetirementComment durably records both retirement authority and the grace
+// deadline. This lets a later run honor the remaining grace period and finish
+// cleanup if the process stops after publication.
+func RetirementComment(cfg *config.Config, idx IndexInfo, retireAfter time.Time, originallyUnowned bool) string {
+	state := "retiring"
+	if originallyUnowned {
+		state = "retire_unowned"
+	}
 	payload, _ := json.Marshal(ownershipMetadata{
-		Version: 1, State: "retire_unowned", Owner: cfg.Reconcile.OwnershipTag,
-		ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
+		Version: 2, State: state, Owner: cfg.Reconcile.OwnershipTag,
+		ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(), StructureHash: idx.ActualStructureHash,
+		RetireAfter: retireAfter.UTC().Format(time.RFC3339Nano),
 	})
 	return ownershipPrefix + string(payload)
 }
@@ -157,8 +180,25 @@ func Inspect(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*Stat
 			idx.indisvalid,
 			idx.indisready,
 			idx.indislive,
+			idx.indnatts,
+			idx.indnkeyatts,
+			COALESCE(key_attribute.attname, ''),
+			format_type(index_attribute.atttypid, index_attribute.atttypmod),
 			COALESCE(pg_get_expr(idx.indexprs, idx.indrelid, true), ''),
 			COALESCE(pg_get_expr(idx.indpred, idx.indrelid, true), ''),
+			ARRAY(
+				SELECT referenced_attribute.attname
+				FROM pg_depend AS dependency
+				JOIN pg_attribute AS referenced_attribute
+				  ON referenced_attribute.attrelid = dependency.refobjid
+				 AND referenced_attribute.attnum = dependency.refobjsubid
+				WHERE dependency.classid = 'pg_class'::regclass
+				  AND dependency.objid = idx.indexrelid
+				  AND dependency.refclassid = 'pg_class'::regclass
+				  AND dependency.refobjid = idx.indrelid
+				  AND dependency.refobjsubid > 0
+				ORDER BY referenced_attribute.attname
+			),
 			COALESCE(array_to_string(index_cls.reloptions, ','), ''),
 			pg_get_indexdef(idx.indexrelid),
 			COALESCE(description.description, ''),
@@ -170,6 +210,12 @@ func Inspect(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*Stat
 		JOIN pg_namespace AS table_ns ON table_ns.oid = table_cls.relnamespace
 		JOIN pg_am AS am ON am.oid = index_cls.relam
 		JOIN pg_opclass AS opc ON opc.oid = idx.indclass[0]
+		JOIN pg_attribute AS index_attribute
+		  ON index_attribute.attrelid = idx.indexrelid
+		 AND index_attribute.attnum = 1
+		LEFT JOIN pg_attribute AS key_attribute
+		  ON key_attribute.attrelid = idx.indrelid
+		 AND key_attribute.attnum = idx.indkey[0]
 		LEFT JOIN pg_description AS description
 		  ON description.objoid = idx.indexrelid
 		 AND description.classoid = 'pg_class'::regclass
@@ -191,15 +237,17 @@ func Inspect(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*Stat
 		var relOptions string
 		if err := rows.Scan(
 			&idx.Schema, &idx.Name, &idx.AccessMethod, &idx.OpClass,
-			&idx.Valid, &idx.Ready, &idx.Live, &idx.IndexExpression,
-			&idx.Predicate, &relOptions, &idx.Definition, &idx.Comment, &idx.Size,
+			&idx.Valid, &idx.Ready, &idx.Live, &idx.TotalColumns, &idx.KeyColumns,
+			&idx.DirectColumn, &idx.IndexType, &idx.IndexExpression,
+			&idx.Predicate, &idx.ReferencedColumns, &relOptions, &idx.Definition, &idx.Comment, &idx.Size,
 		); err != nil {
 			return nil, fmt.Errorf("scanning index info: %w", err)
 		}
-		idx.Owned, idx.LegacyOwnership, idx.RetirementAuthorized, idx.ManagedName, idx.SpecHash = ownership(idx.Comment, cfg.Reconcile.OwnershipTag)
+		idx.M, idx.EFConstruction = parseHNSWParams(relOptions)
+		idx.ActualStructureHash = structureHash(idx)
+		applyOwnership(&idx, ownership(idx.Comment, cfg.Reconcile.OwnershipTag))
 		idx.IsDesired = idx.Name == cfg.Index.Name
 		idx.IsHealthy = idx.Valid && idx.Ready && idx.Live
-		idx.M, idx.EFConstruction = parseHNSWParams(relOptions)
 		indexes = append(indexes, idx)
 	}
 	if err := rows.Err(); err != nil {
@@ -210,7 +258,27 @@ func Inspect(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*Stat
 		Table: cfg.FullyQualifiedName(), VectorColumn: cfg.Table.VectorCol,
 		DesiredIndex: cfg.Index.Name, PGVectorVersion: extVersion, Indexes: indexes,
 	}
+	var relationKind string
+	err = pool.QueryRow(ctx, `
+		SELECT relation.relkind::text
+		FROM pg_class AS relation
+		JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1 AND relation.relname = $2`,
+		cfg.Table.Schema, cfg.Index.Name,
+	).Scan(&relationKind)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("checking desired index namespace: %w", err)
+	}
+	if err == nil && status.Desired() == nil {
+		status.NamespaceConflict = relationKindDescription(relationKind)
+	}
 	status.Drift, status.DriftReasons = detectDrift(indexes, cfg)
+	if status.NamespaceConflict != "" {
+		status.Drift = true
+		status.DriftReasons = append([]string{
+			fmt.Sprintf("desired index name %s is occupied by %s in schema %s", cfg.Index.Name, status.NamespaceConflict, cfg.Table.Schema),
+		}, status.DriftReasons...)
+	}
 	return status, nil
 }
 
@@ -261,13 +329,27 @@ func IndexMatchesSpec(idx IndexInfo, cfg *config.Config) bool {
 }
 
 func indexMatchesSpec(idx IndexInfo, cfg *config.Config) bool {
-	if !idx.IsHealthy || !idx.Owned || idx.LegacyOwnership {
+	if !idx.IsHealthy || !idx.Owned || idx.LegacyOwnership || idx.RetirementPending {
 		return false
 	}
 	if idx.ManagedName != cfg.Index.Name || idx.SpecHash != cfg.SpecHash() {
 		return false
 	}
-	if idx.OpClass != cfg.OpClass() || idx.M != cfg.Index.M || idx.EFConstruction != cfg.Index.EFConstruction {
+	if idx.StructureHash == "" || idx.StructureHash != idx.ActualStructureHash {
+		return false
+	}
+	return IndexStructureMatchesSpec(idx, cfg)
+}
+
+// IndexStructureMatchesSpec verifies catalog structure independently of the
+// ownership/spec claim stored in the index comment.
+func IndexStructureMatchesSpec(idx IndexInfo, cfg *config.Config) bool {
+	if idx.AccessMethod != "hnsw" || idx.OpClass != cfg.OpClass() ||
+		idx.M != cfg.Index.M || idx.EFConstruction != cfg.Index.EFConstruction ||
+		idx.TotalColumns != 1 || idx.KeyColumns != 1 || idx.IndexType != cfg.VectorCast() {
+		return false
+	}
+	if !indexExpressionMatches(idx, cfg) || !sameStrings(idx.ReferencedColumns, expectedReferencedColumns(cfg)) {
 		return false
 	}
 	return (idx.Predicate == "") == (len(cfg.Population.Filters) == 0)
@@ -289,26 +371,149 @@ func parseHNSWParams(relOptions string) (m, efConstruction int) {
 	return m, efConstruction
 }
 
-func ownership(comment, tag string) (owned, legacy, retirementAuthorized bool, managedName, specHash string) {
+type ownershipInfo struct {
+	owned, managed, legacy, retirementAuthorized, retirementPending bool
+	owner, managedName, specHash, structureHash                     string
+	retireAfter                                                     time.Time
+}
+
+func ownership(comment, tag string) ownershipInfo {
 	if tag == "" {
-		return false, false, false, "", ""
+		return ownershipInfo{}
 	}
 	if strings.HasPrefix(comment, ownershipPrefix) {
 		var metadata ownershipMetadata
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(comment, ownershipPrefix)), &metadata); err == nil &&
-			metadata.Version == 1 && metadata.Owner == tag && metadata.ManagedName != "" && metadata.SpecHash != "" {
+			(metadata.Version == 1 || metadata.Version == 2) && metadata.Owner != "" && metadata.ManagedName != "" && metadata.SpecHash != "" {
+			info := ownershipInfo{
+				managed: true, owner: metadata.Owner, managedName: metadata.ManagedName,
+				specHash: metadata.SpecHash, structureHash: metadata.StructureHash,
+			}
+			if metadata.RetireAfter != "" {
+				info.retireAfter, _ = time.Parse(time.RFC3339Nano, metadata.RetireAfter)
+			}
 			switch metadata.State {
 			case "", "managed":
-				return true, false, false, metadata.ManagedName, metadata.SpecHash
+				info.owned = metadata.Owner == tag
+				return info
+			case "retiring":
+				info.owned = metadata.Owner == tag
+				info.retirementPending = true
+				return info
 			case "retire_unowned":
-				return false, false, true, metadata.ManagedName, metadata.SpecHash
+				info.retirementAuthorized = metadata.Owner == tag
+				info.retirementPending = true
+				return info
 			}
 		}
 	}
 	if comment == "/* "+tag+" */" {
-		return true, true, false, "", ""
+		return ownershipInfo{owned: true, legacy: true, owner: tag}
 	}
-	return false, false, false, "", ""
+	return ownershipInfo{}
+}
+
+func applyOwnership(idx *IndexInfo, info ownershipInfo) {
+	idx.Owned = info.owned
+	idx.Managed = info.managed
+	idx.LegacyOwnership = info.legacy
+	idx.RetirementAuthorized = info.retirementAuthorized
+	idx.RetirementPending = info.retirementPending
+	idx.Owner = info.owner
+	idx.ManagedName = info.managedName
+	idx.SpecHash = info.specHash
+	idx.StructureHash = info.structureHash
+	idx.RetireAfter = info.retireAfter
+}
+
+func structureHash(idx IndexInfo) string {
+	type structure struct {
+		AccessMethod      string   `json:"access_method"`
+		OpClass           string   `json:"opclass"`
+		M                 int      `json:"m"`
+		EFConstruction    int      `json:"ef_construction"`
+		TotalColumns      int      `json:"total_columns"`
+		KeyColumns        int      `json:"key_columns"`
+		DirectColumn      string   `json:"direct_column"`
+		IndexType         string   `json:"index_type"`
+		IndexExpression   string   `json:"index_expression"`
+		Predicate         string   `json:"predicate"`
+		ReferencedColumns []string `json:"referenced_columns"`
+	}
+	columns := append([]string(nil), idx.ReferencedColumns...)
+	sort.Strings(columns)
+	payload, _ := json.Marshal(structure{
+		AccessMethod: idx.AccessMethod, OpClass: idx.OpClass, M: idx.M, EFConstruction: idx.EFConstruction,
+		TotalColumns: idx.TotalColumns, KeyColumns: idx.KeyColumns, DirectColumn: idx.DirectColumn,
+		IndexType: idx.IndexType, IndexExpression: idx.IndexExpression, Predicate: idx.Predicate,
+		ReferencedColumns: columns,
+	})
+	hash := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", hash[:])
+}
+
+func indexExpressionMatches(idx IndexInfo, cfg *config.Config) bool {
+	if idx.DirectColumn != "" {
+		return idx.DirectColumn == cfg.Table.VectorCol && idx.IndexExpression == ""
+	}
+	quoted := config.QuoteIdentifier(cfg.Table.VectorCol)
+	identifiers := []string{cfg.Table.VectorCol, quoted}
+	for _, identifier := range identifiers {
+		for _, expected := range []string{
+			fmt.Sprintf("(%s)::%s", identifier, cfg.VectorCast()),
+			fmt.Sprintf("%s::%s", identifier, cfg.VectorCast()),
+			fmt.Sprintf("(%s::%s)", identifier, cfg.VectorCast()),
+		} {
+			if idx.IndexExpression == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func expectedReferencedColumns(cfg *config.Config) []string {
+	seen := map[string]struct{}{cfg.Table.VectorCol: {}}
+	for _, filter := range cfg.Population.Filters {
+		seen[filter.Column] = struct{}{}
+	}
+	columns := make([]string, 0, len(seen))
+	for column := range seen {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	return columns
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func relationKindDescription(kind string) string {
+	switch kind {
+	case "r", "p":
+		return "a table"
+	case "v":
+		return "a view"
+	case "m":
+		return "a materialized view"
+	case "S":
+		return "a sequence"
+	case "i", "I":
+		return "another index"
+	case "f":
+		return "a foreign table"
+	default:
+		return "another relation"
+	}
 }
 
 func detectDrift(indexes []IndexInfo, cfg *config.Config) (bool, []string) {
@@ -342,6 +547,9 @@ func detectDrift(indexes []IndexInfo, cfg *config.Config) (bool, []string) {
 	} else if desired.LegacyOwnership {
 		reasons = append(reasons, fmt.Sprintf("desired index %s has legacy ownership metadata", desired.Name))
 	}
+	if desired.RetirementPending {
+		reasons = append(reasons, fmt.Sprintf("desired index %s is marked for retirement", desired.Name))
+	}
 	if desired.ManagedName != "" && desired.ManagedName != cfg.Index.Name {
 		reasons = append(reasons, fmt.Sprintf("desired index %s belongs to managed family %s", desired.Name, desired.ManagedName))
 	}
@@ -357,12 +565,27 @@ func detectDrift(indexes []IndexInfo, cfg *config.Config) (bool, []string) {
 	if desired.EFConstruction != cfg.Index.EFConstruction {
 		reasons = append(reasons, fmt.Sprintf("desired index %s has ef_construction=%d, expected %d", desired.Name, desired.EFConstruction, cfg.Index.EFConstruction))
 	}
+	if desired.TotalColumns != 1 || desired.KeyColumns != 1 {
+		reasons = append(reasons, fmt.Sprintf("desired index %s does not have exactly one HNSW key and no included columns", desired.Name))
+	}
+	if desired.IndexType != cfg.VectorCast() {
+		reasons = append(reasons, fmt.Sprintf("desired index %s stores %s values, expected %s", desired.Name, desired.IndexType, cfg.VectorCast()))
+	}
+	if !indexExpressionMatches(*desired, cfg) {
+		reasons = append(reasons, fmt.Sprintf("desired index %s does not index the configured vector column/cast", desired.Name))
+	}
+	if !sameStrings(desired.ReferencedColumns, expectedReferencedColumns(cfg)) {
+		reasons = append(reasons, fmt.Sprintf("desired index %s references columns outside the configured vector/population contract", desired.Name))
+	}
 	if (desired.Predicate == "") != (len(cfg.Population.Filters) == 0) {
 		reasons = append(reasons, fmt.Sprintf("desired index %s partial-index predicate presence does not match the configured population", desired.Name))
 	}
-	if desired.Owned && !desired.LegacyOwnership && desired.SpecHash == cfg.SpecHash() &&
-		!indexMatchesSpec(*desired, cfg) && len(reasons) == 0 {
-		reasons = append(reasons, fmt.Sprintf("desired index %s does not match the configured spec", desired.Name))
+	if desired.Owned && !desired.LegacyOwnership {
+		if desired.StructureHash == "" {
+			reasons = append(reasons, fmt.Sprintf("desired index %s lacks structural verification metadata", desired.Name))
+		} else if desired.StructureHash != desired.ActualStructureHash {
+			reasons = append(reasons, fmt.Sprintf("desired index %s catalog structure differs from its verified structure", desired.Name))
+		}
 	}
 	return len(reasons) > 0, reasons
 }

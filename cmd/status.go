@@ -87,10 +87,12 @@ func printStatus(status *catalog.Status, cfg *config.Config) {
 		fmt.Println("    ─────────────────────────  ──────────  ────────  ────────  ────────  ────────  ──────────")
 		for _, idx := range status.Indexes {
 			owned := "no"
-			if idx.Owned {
-				owned = "yes"
-			} else if idx.RetirementAuthorized {
+			if idx.RetirementPending {
 				owned = "retire"
+			} else if idx.Owned {
+				owned = "yes"
+			} else if idx.Managed {
+				owned = "foreign"
 			}
 			fmt.Printf("    %-25s  %-10s  %-8t  %-8t  %-8t  %-8s  %-10s\n",
 				idx.Name, idx.AccessMethod, idx.Valid, idx.Ready, idx.Live, owned, idx.Size)

@@ -1,6 +1,7 @@
 package reconciler
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -55,15 +56,12 @@ func TestBuildPlanRepairsOwnedSpecDrift(t *testing.T) {
 
 func TestBuildPlanPreservesOtherManagedFamilies(t *testing.T) {
 	cfg := testConfig()
+	desired := matchingIndex(cfg, cfg.Index.Name)
+	desired.IsDesired = true
 	status := &catalog.Status{
 		Table: "public.documents", Drift: true,
 		Indexes: []catalog.IndexInfo{
-			{
-				Name: cfg.Index.Name, IsDesired: true, IsHealthy: true, Owned: true,
-				ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
-				OpClass: cfg.OpClass(), M: cfg.Index.M, EFConstruction: cfg.Index.EFConstruction,
-				Predicate: "status = 'active'::text",
-			},
+			desired,
 			{
 				Name: "documents_other_population_idx", IsHealthy: true, Owned: true,
 				ManagedName: "documents_other_population_idx", SpecHash: "other",
@@ -80,19 +78,47 @@ func TestBuildPlanPreservesOtherManagedFamilies(t *testing.T) {
 
 func TestBuildPlanReusesVerifiedReplacement(t *testing.T) {
 	cfg := testConfig()
+	replacement := matchingIndex(cfg, "documents_embedding_idx_build_123")
 	status := &catalog.Status{
 		Table: "public.documents", Drift: true,
 		DriftReasons: []string{"desired missing"},
-		Indexes: []catalog.IndexInfo{{
-			Name: "documents_embedding_idx_build_123", IsHealthy: true, Owned: true,
-			ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
-			OpClass: cfg.OpClass(), M: cfg.Index.M, EFConstruction: cfg.Index.EFConstruction,
-			Predicate: "status = 'active'::text",
-		}},
+		Indexes:      []catalog.IndexInfo{replacement},
 	}
 	plan := buildPlan(status, cfg)
 	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionPublish {
 		t.Fatalf("buildPlan() = %#v, want reuse/publish only", plan)
+	}
+}
+
+func TestBuildPlanBlocksAnotherManagedFamilyEvenWhenDropUnownedIsEnabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.Reconcile.DropUnowned = true
+	foreign := matchingIndex(cfg, cfg.Index.Name)
+	foreign.IsDesired = true
+	foreign.ManagedName = "another_family_idx"
+	status := &catalog.Status{Table: "public.documents", Drift: true, Indexes: []catalog.IndexInfo{foreign}}
+
+	plan := buildPlan(status, cfg)
+	if !plan.Blocked || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionBlocked {
+		t.Fatalf("buildPlan() = %#v, want managed-family block", plan)
+	}
+	if _, err := blockingConflict(status, cfg); !errors.Is(err, ErrManagedFamilyConflict) {
+		t.Fatalf("blockingConflict() error = %v, want ErrManagedFamilyConflict", err)
+	}
+}
+
+func TestBuildPlanBlocksNamespaceConflict(t *testing.T) {
+	cfg := testConfig()
+	status := &catalog.Status{
+		Table: "public.documents", Drift: true, NamespaceConflict: "a table",
+		DriftReasons: []string{"desired name is occupied"},
+	}
+	plan := buildPlan(status, cfg)
+	if !plan.Blocked || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionBlocked {
+		t.Fatalf("buildPlan() = %#v, want namespace block", plan)
+	}
+	if _, err := blockingConflict(status, cfg); !errors.Is(err, ErrNamespaceConflict) {
+		t.Fatalf("blockingConflict() error = %v, want ErrNamespaceConflict", err)
 	}
 }
 
@@ -125,5 +151,16 @@ func testConfig() *config.Config {
 		},
 		Population: config.PopulationConfig{Filters: []config.FilterConfig{{Column: "status", Values: []string{"active"}}}},
 		Reconcile:  config.ReconcileConfig{OwnershipTag: "pgvector-index-manager"},
+	}
+}
+
+func matchingIndex(cfg *config.Config, name string) catalog.IndexInfo {
+	return catalog.IndexInfo{
+		Name: name, IsHealthy: true, Valid: true, Ready: true, Live: true,
+		Owned: true, Managed: true, ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
+		StructureHash: "verified-structure", ActualStructureHash: "verified-structure",
+		AccessMethod: "hnsw", OpClass: cfg.OpClass(), M: cfg.Index.M, EFConstruction: cfg.Index.EFConstruction,
+		TotalColumns: 1, KeyColumns: 1, DirectColumn: cfg.Table.VectorCol, IndexType: cfg.VectorCast(),
+		ReferencedColumns: []string{cfg.Table.VectorCol, "status"}, Predicate: "status = 'active'::text",
 	}
 }

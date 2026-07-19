@@ -20,9 +20,19 @@ import (
 	"github.com/lame13/pgvector-index-manager/internal/pg"
 )
 
-// ErrUnownedDesired is returned when applying drift would require replacing a
-// same-name index that the manager cannot prove it owns.
-var ErrUnownedDesired = errors.New("desired index is unowned")
+var (
+	// ErrUnownedDesired is returned when applying drift would require replacing
+	// a same-name index that the manager cannot prove it owns.
+	ErrUnownedDesired = errors.New("desired index is unowned")
+
+	// ErrManagedFamilyConflict is returned when the desired name is occupied by
+	// an index carrying structured metadata for another owner or managed family.
+	ErrManagedFamilyConflict = errors.New("desired index belongs to another managed family")
+
+	// ErrNamespaceConflict is returned when a non-target relation already owns
+	// the desired schema/name.
+	ErrNamespaceConflict = errors.New("desired index name has a namespace conflict")
+)
 
 type ActionKind string
 
@@ -83,18 +93,14 @@ func buildPlan(status *catalog.Status, cfg *config.Config) *PlanResult {
 	if !status.Drift {
 		return result
 	}
+	if action, _ := blockingConflict(status, cfg); action != nil {
+		result.Blocked = true
+		result.Actions = append(result.Actions, *action)
+		return result
+	}
 
 	desired := status.Desired()
 	if desired == nil || !catalog.IndexMatchesSpec(*desired, cfg) {
-		if desired != nil && !desired.Owned && !cfg.Reconcile.DropUnowned {
-			result.Blocked = true
-			result.Actions = append(result.Actions, Action{
-				Kind:        ActionBlocked,
-				Description: fmt.Sprintf("Refuse to replace unowned index %s", desired.Name),
-				Reason:      "set reconcile.drop_unowned=true only after reviewing the plan and accepting destructive replacement",
-			})
-			return result
-		}
 		if replacement := status.MatchingReplacement(cfg); replacement != nil {
 			result.Actions = append(result.Actions, Action{
 				Kind: ActionPublish, Description: fmt.Sprintf("Publish verified replacement %s as %s", replacement.Name, cfg.Index.Name),
@@ -122,7 +128,7 @@ func buildPlan(status *catalog.Status, cfg *config.Config) *PlanResult {
 		}
 		result.Actions = append(result.Actions, Action{
 			Kind: ActionRetire, Description: fmt.Sprintf("Retire stale managed index %s", idx.Name),
-			Reason: "the desired index is verified and this index belongs to the same managed family",
+			Reason: retirementPlanReason(idx, cfg),
 		})
 	}
 	return result
@@ -152,7 +158,8 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 			result.Actions = append(result.Actions, item)
 		}
 		if plan.Blocked {
-			return result, ErrUnownedDesired
+			_, conflictErr := blockingConflict(status, cfg)
+			return result, conflictErr
 		}
 		return result, nil
 	}
@@ -178,15 +185,13 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 	if !status.Drift {
 		return result, nil
 	}
+	if action, conflictErr := blockingConflict(status, cfg); action != nil {
+		appendFailure(result, action.Kind, cfg.Index.Name, action.Description, conflictErr)
+		return result, conflictErr
+	}
 
 	desired := status.Desired()
 	if desired == nil || !catalog.IndexMatchesSpec(*desired, cfg) {
-		if desired != nil && !desired.Owned && !cfg.Reconcile.DropUnowned {
-			err := fmt.Errorf("%w: %s; review plan and set reconcile.drop_unowned=true to authorize replacement", ErrUnownedDesired, desired.Name)
-			appendFailure(result, ActionBlocked, desired.Name, fmt.Sprintf("Refuse to replace unowned index %s", desired.Name), err)
-			return result, err
-		}
-
 		replacement := status.MatchingReplacement(cfg)
 		if replacement == nil {
 			built, err := buildReplacement(ctx, lockConn, pool, cfg, result)
@@ -196,8 +201,7 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 			replacement = built
 		}
 
-		retired, err := publishReplacement(ctx, lockConn, cfg, *replacement, desired, result)
-		if err != nil {
+		if err := publishReplacement(ctx, lockConn, cfg, *replacement, desired, result); err != nil {
 			return result, err
 		}
 
@@ -213,15 +217,6 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 			return result, err
 		}
 
-		if retired != nil {
-			if err := waitGracePeriod(ctx, cfg); err != nil {
-				result.Failed = true
-				return result, err
-			}
-			if err := retireIndex(ctx, lockConn, *retired, cfg, result); err != nil {
-				return result, err
-			}
-		}
 	}
 
 	// Re-inspect only after the desired name has been verified. Retire only
@@ -236,7 +231,16 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 		if idx.IsDesired || !sameManagedFamily(idx, cfg) {
 			continue
 		}
-		if err := retireIndex(ctx, lockConn, idx, cfg, result); err != nil {
+		scheduled, err := ensureRetirementScheduled(ctx, lockConn, idx, cfg)
+		if err != nil {
+			result.Failed = true
+			return result, err
+		}
+		if err := waitUntil(ctx, lockConn, scheduled.RetireAfter); err != nil {
+			result.Failed = true
+			return result, err
+		}
+		if err := retireIndex(ctx, lockConn, scheduled, cfg, result); err != nil {
 			return result, err
 		}
 	}
@@ -322,9 +326,7 @@ func buildReplacement(ctx context.Context, conn *pgxpool.Conn, pool *pgxpool.Poo
 		return nil, err
 	}
 	candidate := findIndex(status.Indexes, name)
-	if candidate == nil || !candidate.IsHealthy || candidate.OpClass != cfg.OpClass() ||
-		candidate.M != cfg.Index.M || candidate.EFConstruction != cfg.Index.EFConstruction ||
-		(candidate.Predicate == "") != (len(cfg.Population.Filters) == 0) {
+	if candidate == nil || !candidate.IsHealthy || !catalog.IndexStructureMatchesSpec(*candidate, cfg) {
 		err := fmt.Errorf("replacement index did not pass catalog verification")
 		appendFailure(result, ActionBuild, name, fmt.Sprintf("Verify replacement index %s", name), err)
 		if cleanupErr := cleanupAttemptedIndex(conn, cfg, name); cleanupErr != nil {
@@ -334,7 +336,7 @@ func buildReplacement(ctx context.Context, conn *pgxpool.Conn, pool *pgxpool.Poo
 	}
 
 	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s IS %s",
-		qualifiedIndex(cfg.Table.Schema, name), config.QuoteLiteral(catalog.OwnershipComment(cfg)))
+		qualifiedIndex(cfg.Table.Schema, name), config.QuoteLiteral(catalog.OwnershipComment(cfg, *candidate)))
 	if _, err := conn.Exec(ctx, commentSQL); err != nil {
 		appendFailure(result, ActionBuild, name, fmt.Sprintf("Record ownership for index %s", name), err)
 		if cleanupErr := cleanupAttemptedIndex(conn, cfg, name); cleanupErr != nil {
@@ -361,63 +363,65 @@ func buildReplacement(ctx context.Context, conn *pgxpool.Conn, pool *pgxpool.Poo
 	return candidate, nil
 }
 
-func publishReplacement(ctx context.Context, conn *pgxpool.Conn, cfg *config.Config, replacement catalog.IndexInfo, current *catalog.IndexInfo, result *ApplyResult) (*catalog.IndexInfo, error) {
+func publishReplacement(ctx context.Context, conn *pgxpool.Conn, cfg *config.Config, replacement catalog.IndexInfo, current *catalog.IndexInfo, result *ApplyResult) error {
 	started := time.Now()
 	if err := pg.ConfigureSession(ctx, conn, cfg.Connection.StatementTimeout, cfg.Connection.LockTimeout); err != nil {
-		return nil, err
+		return err
+	}
+	gracePeriod, err := configuredGracePeriod(cfg)
+	if err != nil {
+		return err
 	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("beginning atomic index swap: %w", err)
+		return fmt.Errorf("beginning atomic index swap: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	var retired *catalog.IndexInfo
 	if current != nil {
 		retirementName, err := temporaryIndexName(cfg.Index.Name, "retired")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		renameOldSQL := fmt.Sprintf("ALTER INDEX %s RENAME TO %s",
 			qualifiedIndex(current.Schema, current.Name), config.QuoteIdentifier(retirementName))
 		if _, err := tx.Exec(ctx, renameOldSQL); err != nil {
 			appendFailure(result, ActionPublish, cfg.Index.Name, fmt.Sprintf("Move current index %s aside", current.Name), err)
-			return nil, fmt.Errorf("renaming current index: %w", err)
+			return fmt.Errorf("renaming current index: %w", err)
 		}
-		if !current.Owned {
-			commentSQL := fmt.Sprintf("COMMENT ON INDEX %s IS %s",
-				qualifiedIndex(current.Schema, retirementName), config.QuoteLiteral(catalog.RetirementComment(cfg)))
-			if _, err := tx.Exec(ctx, commentSQL); err != nil {
-				appendFailure(result, ActionPublish, current.Name, fmt.Sprintf("Record authorized retirement for %s", current.Name), err)
-				return nil, fmt.Errorf("recording authorized retirement: %w", err)
-			}
+		retired := *current
+		retired.Name = retirementName
+		retired.IsDesired = false
+		var retireAfter time.Time
+		if err := tx.QueryRow(ctx,
+			"SELECT clock_timestamp() + ($1 * interval '1 second')", gracePeriod.Seconds(),
+		).Scan(&retireAfter); err != nil {
+			return fmt.Errorf("calculating retirement deadline: %w", err)
 		}
-		copy := *current
-		copy.Name = retirementName
-		copy.IsDesired = false
-		if !current.Owned {
-			copy.RetirementAuthorized = true
-			copy.ManagedName = cfg.Index.Name
-			copy.SpecHash = cfg.SpecHash()
+		commentSQL := fmt.Sprintf("COMMENT ON INDEX %s IS %s",
+			qualifiedIndex(current.Schema, retirementName),
+			config.QuoteLiteral(catalog.RetirementComment(cfg, retired, retireAfter, !current.Owned)))
+		if _, err := tx.Exec(ctx, commentSQL); err != nil {
+			appendFailure(result, ActionPublish, current.Name, fmt.Sprintf("Record durable retirement deadline for %s", current.Name), err)
+			return fmt.Errorf("recording durable retirement deadline: %w", err)
 		}
-		retired = &copy
 	}
 
 	renameReplacementSQL := fmt.Sprintf("ALTER INDEX %s RENAME TO %s",
 		qualifiedIndex(replacement.Schema, replacement.Name), config.QuoteIdentifier(cfg.Index.Name))
 	if _, err := tx.Exec(ctx, renameReplacementSQL); err != nil {
 		appendFailure(result, ActionPublish, cfg.Index.Name, fmt.Sprintf("Publish replacement as %s", cfg.Index.Name), err)
-		return nil, fmt.Errorf("publishing replacement index: %w", err)
+		return fmt.Errorf("publishing replacement index: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		appendFailure(result, ActionPublish, cfg.Index.Name, fmt.Sprintf("Commit publication of %s", cfg.Index.Name), err)
-		return nil, fmt.Errorf("committing atomic index swap: %w", err)
+		return fmt.Errorf("committing atomic index swap: %w", err)
 	}
 	result.Actions = append(result.Actions, ActionResult{
 		Kind: ActionPublish, IndexName: cfg.Index.Name,
 		Description: fmt.Sprintf("Atomically publish replacement as %s", cfg.Index.Name), Duration: time.Since(started),
 	})
-	return retired, nil
+	return nil
 }
 
 func retireIndex(ctx context.Context, conn *pgxpool.Conn, idx catalog.IndexInfo, cfg *config.Config, result *ApplyResult) error {
@@ -438,15 +442,56 @@ func retireIndex(ctx context.Context, conn *pgxpool.Conn, idx catalog.IndexInfo,
 	return nil
 }
 
-func waitGracePeriod(ctx context.Context, cfg *config.Config) error {
+func ensureRetirementScheduled(ctx context.Context, conn *pgxpool.Conn, idx catalog.IndexInfo, cfg *config.Config) (catalog.IndexInfo, error) {
+	if err := pg.ConfigureSession(ctx, conn, cfg.Connection.StatementTimeout, cfg.Connection.LockTimeout); err != nil {
+		return idx, err
+	}
+	if idx.RetirementPending && !idx.RetireAfter.IsZero() {
+		return idx, nil
+	}
+	gracePeriod, err := configuredGracePeriod(cfg)
+	if err != nil {
+		return idx, err
+	}
+	if err := conn.QueryRow(ctx,
+		"SELECT clock_timestamp() + ($1 * interval '1 second')", gracePeriod.Seconds(),
+	).Scan(&idx.RetireAfter); err != nil {
+		return idx, fmt.Errorf("calculating retirement deadline for index %s: %w", idx.Name, err)
+	}
+	comment := catalog.RetirementComment(cfg, idx, idx.RetireAfter, idx.RetirementAuthorized)
+	commentSQL := fmt.Sprintf("COMMENT ON INDEX %s IS %s",
+		qualifiedIndex(idx.Schema, idx.Name), config.QuoteLiteral(comment))
+	if _, err := conn.Exec(ctx, commentSQL); err != nil {
+		return idx, fmt.Errorf("recording retirement deadline for index %s: %w", idx.Name, err)
+	}
+	idx.RetirementPending = true
+	return idx, nil
+}
+
+func configuredGracePeriod(cfg *config.Config) (time.Duration, error) {
 	if cfg.Reconcile.GracePeriod == "" {
-		return nil
+		return 0, nil
 	}
 	duration, err := time.ParseDuration(cfg.Reconcile.GracePeriod)
-	if err != nil || duration <= 0 {
-		return err
+	if err != nil {
+		return 0, fmt.Errorf("parsing grace period: %w", err)
 	}
-	log.Printf("Applying retirement grace period of %s...", duration)
+	if duration < 0 {
+		return 0, fmt.Errorf("grace period must be at least zero")
+	}
+	return duration, nil
+}
+
+func waitUntil(ctx context.Context, conn *pgxpool.Conn, deadline time.Time) error {
+	var databaseNow time.Time
+	if err := conn.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&databaseNow); err != nil {
+		return fmt.Errorf("checking retirement deadline: %w", err)
+	}
+	duration := deadline.Sub(databaseNow)
+	if duration <= 0 {
+		return nil
+	}
+	log.Printf("Waiting %s for durable retirement grace period...", duration.Round(time.Second))
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
@@ -457,10 +502,50 @@ func waitGracePeriod(ctx context.Context, cfg *config.Config) error {
 	}
 }
 
+func retirementPlanReason(idx catalog.IndexInfo, cfg *config.Config) string {
+	base := "the desired index is verified and this index belongs to the same managed family"
+	if !idx.RetireAfter.IsZero() {
+		return fmt.Sprintf("%s; its durable grace deadline is %s", base, idx.RetireAfter.UTC().Format(time.RFC3339Nano))
+	}
+	if gracePeriod, err := configuredGracePeriod(cfg); err == nil && gracePeriod > 0 {
+		return fmt.Sprintf("%s; apply will persist and honor a %s grace period before dropping it", base, gracePeriod)
+	}
+	return base
+}
+
 func sameManagedFamily(idx catalog.IndexInfo, cfg *config.Config) bool {
 	managed := idx.Owned && !idx.LegacyOwnership
 	authorizedUnowned := idx.RetirementAuthorized && cfg.Reconcile.DropUnowned
 	return (managed || authorizedUnowned) && idx.ManagedName == cfg.Index.Name
+}
+
+func blockingConflict(status *catalog.Status, cfg *config.Config) (*Action, error) {
+	if status.NamespaceConflict != "" {
+		err := fmt.Errorf("%w: %s.%s is occupied by %s", ErrNamespaceConflict, cfg.Table.Schema, cfg.Index.Name, status.NamespaceConflict)
+		return &Action{
+			Kind: ActionBlocked, Description: fmt.Sprintf("Refuse to publish %s because its namespace is occupied", cfg.Index.Name),
+			Reason: err.Error(),
+		}, err
+	}
+	desired := status.Desired()
+	if desired == nil {
+		return nil, nil
+	}
+	if desired.Managed && (!desired.Owned || desired.ManagedName != cfg.Index.Name || desired.RetirementPending) {
+		err := fmt.Errorf("%w: %s is owned by %q for family %q", ErrManagedFamilyConflict, desired.Name, desired.Owner, desired.ManagedName)
+		return &Action{
+			Kind: ActionBlocked, Description: fmt.Sprintf("Refuse to replace managed index %s", desired.Name),
+			Reason: "choose a unique index name or reconcile it with the configuration that owns that managed family",
+		}, err
+	}
+	if !desired.Owned && !cfg.Reconcile.DropUnowned {
+		err := fmt.Errorf("%w: %s; review plan and set reconcile.drop_unowned=true to authorize replacement", ErrUnownedDesired, desired.Name)
+		return &Action{
+			Kind: ActionBlocked, Description: fmt.Sprintf("Refuse to replace unowned index %s", desired.Name),
+			Reason: "set reconcile.drop_unowned=true only after reviewing the plan and accepting destructive replacement",
+		}, err
+	}
+	return nil, nil
 }
 
 func findIndex(indexes []catalog.IndexInfo, name string) *catalog.IndexInfo {

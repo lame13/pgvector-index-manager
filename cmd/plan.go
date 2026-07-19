@@ -96,7 +96,7 @@ func printPlan(plan *reconciler.PlanResult, cfg *config.Config) {
 	}
 	if plan.Blocked {
 		fmt.Println()
-		fmt.Println("  Result: BLOCKED — apply will not mutate an unowned same-name index.")
+		fmt.Println("  Result: BLOCKED — apply will not mutate the conflicting same-name relation.")
 	}
 
 	fmt.Println()

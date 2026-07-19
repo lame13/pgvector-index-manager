@@ -3,6 +3,7 @@ package catalog
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lame13/pgvector-index-manager/internal/config"
 )
@@ -89,23 +90,56 @@ func TestParseHNSWParams(t *testing.T) {
 
 func TestStructuredOwnership(t *testing.T) {
 	cfg := testConfig()
-	comment := OwnershipComment(cfg)
-	owned, legacy, retirement, managedName, specHash := ownership(comment, cfg.Reconcile.OwnershipTag)
-	if !owned || legacy || retirement || managedName != cfg.Index.Name || specHash != cfg.SpecHash() {
-		t.Fatalf("ownership(%q) = %t, %t, %t, %q, %q", comment, owned, legacy, retirement, managedName, specHash)
+	idx := matchingDesired(cfg)
+	comment := OwnershipComment(cfg, idx)
+	info := ownership(comment, cfg.Reconcile.OwnershipTag)
+	if !info.owned || !info.managed || info.legacy || info.retirementPending ||
+		info.managedName != cfg.Index.Name || info.specHash != cfg.SpecHash() || info.structureHash != idx.ActualStructureHash {
+		t.Fatalf("ownership(%q) = %#v", comment, info)
 	}
 
-	owned, legacy, retirement, managedName, specHash = ownership("/* pgvector-index-manager */", cfg.Reconcile.OwnershipTag)
-	if !owned || !legacy || retirement || managedName != "" || specHash != "" {
-		t.Fatalf("legacy ownership = %t, %t, %t, %q, %q", owned, legacy, retirement, managedName, specHash)
+	info = ownership("/* pgvector-index-manager */", cfg.Reconcile.OwnershipTag)
+	if !info.owned || !info.legacy || info.retirementPending || info.managedName != "" || info.specHash != "" {
+		t.Fatalf("legacy ownership = %#v", info)
 	}
-	if owned, _, _, _, _ := ownership(comment, "another-owner"); owned {
-		t.Fatal("ownership accepted a different owner tag")
+	if other := ownership(comment, "another-owner"); other.owned || !other.managed || other.owner != cfg.Reconcile.OwnershipTag {
+		t.Fatalf("other owner metadata = %#v, want visible but not owned", other)
 	}
 
-	owned, legacy, retirement, managedName, specHash = ownership(RetirementComment(cfg), cfg.Reconcile.OwnershipTag)
-	if owned || legacy || !retirement || managedName != cfg.Index.Name || specHash != cfg.SpecHash() {
-		t.Fatalf("retirement ownership = %t, %t, %t, %q, %q", owned, legacy, retirement, managedName, specHash)
+	deadline := time.Date(2026, 7, 19, 12, 0, 0, 123, time.UTC)
+	info = ownership(RetirementComment(cfg, idx, deadline, true), cfg.Reconcile.OwnershipTag)
+	if info.owned || info.legacy || !info.retirementAuthorized || !info.retirementPending ||
+		info.managedName != cfg.Index.Name || info.specHash != cfg.SpecHash() || !info.retireAfter.Equal(deadline) {
+		t.Fatalf("retirement ownership = %#v", info)
+	}
+}
+
+func TestIndexMatchesSpecVerifiesCatalogStructure(t *testing.T) {
+	cfg := testConfig()
+	base := matchingDesired(cfg)
+	if !IndexMatchesSpec(base, cfg) {
+		t.Fatal("matching catalog structure was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*IndexInfo)
+	}{
+		{name: "changed catalog fingerprint", mutate: func(idx *IndexInfo) { idx.ActualStructureHash = "changed" }},
+		{name: "wrong dimensions", mutate: func(idx *IndexInfo) { idx.IndexType = "vector(64)" }},
+		{name: "wrong source column", mutate: func(idx *IndexInfo) { idx.DirectColumn = "other_embedding" }},
+		{name: "extra referenced column", mutate: func(idx *IndexInfo) { idx.ReferencedColumns = append(idx.ReferencedColumns, "tenant_id") }},
+		{name: "included column", mutate: func(idx *IndexInfo) { idx.TotalColumns = 2 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := base
+			idx.ReferencedColumns = append([]string(nil), base.ReferencedColumns...)
+			tt.mutate(&idx)
+			if IndexMatchesSpec(idx, cfg) {
+				t.Fatalf("IndexMatchesSpec() accepted %#v", idx)
+			}
+		})
 	}
 }
 
@@ -113,9 +147,12 @@ func matchingDesired(cfg *config.Config) IndexInfo {
 	return IndexInfo{
 		Name: cfg.Index.Name, IsDesired: true,
 		Valid: true, Ready: true, Live: true, IsHealthy: true,
-		Owned: true, ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
+		Owned: true, Managed: true, ManagedName: cfg.Index.Name, SpecHash: cfg.SpecHash(),
+		StructureHash: "verified-structure", ActualStructureHash: "verified-structure",
 		OpClass: cfg.OpClass(), M: cfg.Index.M, EFConstruction: cfg.Index.EFConstruction,
-		Predicate: "status = 'active'::text",
+		AccessMethod: "hnsw", TotalColumns: 1, KeyColumns: 1,
+		DirectColumn: cfg.Table.VectorCol, IndexType: cfg.VectorCast(),
+		ReferencedColumns: []string{cfg.Table.VectorCol, "status"}, Predicate: "status = 'active'::text",
 	}
 }
 

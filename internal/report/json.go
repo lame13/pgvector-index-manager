@@ -131,7 +131,7 @@ func genericActionDescription(kind reconciler.ActionKind) string {
 	case reconciler.ActionRetire:
 		return "Retire superseded managed index concurrently"
 	case reconciler.ActionBlocked:
-		return "Refuse to replace unowned same-name index"
+		return "Refuse unsafe same-name replacement"
 	default:
 		return "Reconciliation action"
 	}
