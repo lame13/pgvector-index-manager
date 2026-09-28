@@ -438,3 +438,100 @@ func containsDriftReason(reasons []string, fragment string) bool {
 	}
 	return false
 }
+
+func TestApplyAllIntegrationReconcilesIndependentTargets(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+
+	active := integrationConfig(schema, "documents_active_idx", "a")
+	active.Name = "active"
+	other := integrationConfig(schema, "documents_other_idx", "b")
+	other.Name = "other"
+	// Managed index names isolate families even when they share an ownership tag.
+	targets := []Target{
+		{Name: active.Name, Config: active, Pool: pool},
+		{Name: other.Name, Config: other, Pool: pool},
+	}
+
+	multi := ApplyAll(ctx, targets, false)
+	if multi.Failed() {
+		t.Fatalf("ApplyAll() errors = %v", multi.Errors())
+	}
+	if len(multi.Targets) != 2 || !multi.Changed() {
+		t.Fatalf("ApplyAll() = %#v, want two changed targets", multi.Targets)
+	}
+	for _, cfg := range []*config.Config{active, other} {
+		status, err := catalog.Inspect(ctx, pool, cfg)
+		if err != nil {
+			t.Fatalf("Inspect(%s) error = %v", cfg.Index.Name, err)
+		}
+		desired := status.Desired()
+		if desired == nil || !catalog.IndexMatchesSpec(*desired, cfg) {
+			t.Fatalf("target %s did not converge: %#v", cfg.Name, desired)
+		}
+	}
+	// Repairing one family must also preserve the other family sharing its tag.
+	if _, err := pool.Exec(ctx, fmt.Sprintf("ALTER INDEX %s.%s SET (m = 32)",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(active.Index.Name))); err != nil {
+		t.Fatal(err)
+	}
+	multi = ApplyAll(ctx, targets, false)
+	if multi.Failed() || len(multi.Targets[0].Result.Actions) != 3 || len(multi.Targets[1].Result.Actions) != 0 {
+		t.Fatalf("repair ApplyAll() = %#v, want only the first family repaired", multi.Targets)
+	}
+	// A further pass converges with nothing to do and retires neither family.
+	multi = ApplyAll(ctx, targets, false)
+	if multi.Failed() || multi.Changed() {
+		t.Fatalf("converged ApplyAll() = %#v, want a no-op", multi.Targets)
+	}
+	for _, name := range []string{active.Index.Name, other.Index.Name} {
+		if !relationExists(t, pool, schema+"."+name) {
+			t.Fatalf("multi-target pass retired %s", name)
+		}
+	}
+}
+
+func TestApplyAllIntegrationIsolatesTargetFailures(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	schema := integrationSchema(t, pool)
+
+	healthy := integrationConfig(schema, "documents_active_idx", "a")
+	healthy.Name = "healthy"
+	broken := integrationConfig(schema, "documents_other_idx", "b")
+	broken.Name = "broken"
+	// An unrelated table on the broken target's index name fails namespace
+	// preflight, which must not cost the healthy target its work.
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s.%s (id integer)",
+		config.QuoteIdentifier(schema), config.QuoteIdentifier(broken.Index.Name))); err != nil {
+		t.Fatal(err)
+	}
+
+	multi := ApplyAll(ctx, []Target{
+		{Name: broken.Name, Config: broken, Pool: pool},
+		{Name: healthy.Name, Config: healthy, Pool: pool},
+	}, false)
+	if len(multi.Targets) != 2 {
+		t.Fatalf("ApplyAll() targets = %#v, want two entries", multi.Targets)
+	}
+	if !errors.Is(multi.Targets[0].Err, ErrNamespaceConflict) {
+		t.Fatalf("broken target error = %v, want ErrNamespaceConflict", multi.Targets[0].Err)
+	}
+	if !multi.Failed() {
+		t.Fatal("Failed() = false, want true when one target is blocked")
+	}
+	healthyResult := multi.Targets[1].Result
+	if multi.Targets[1].Err != nil || healthyResult == nil || len(healthyResult.Actions) != 2 {
+		t.Fatalf("healthy target after a blocked peer = %#v/%v, want build and publish", healthyResult, multi.Targets[1].Err)
+	}
+
+	status, err := catalog.Inspect(ctx, pool, healthy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := status.Desired()
+	if desired == nil || !catalog.IndexMatchesSpec(*desired, healthy) {
+		t.Fatalf("healthy target did not converge alongside a blocked peer: %#v", desired)
+	}
+}

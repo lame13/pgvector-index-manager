@@ -1,0 +1,81 @@
+# pgvector-index-manager multi-target sample configuration
+#
+# Top-level sections are shared defaults. Every entry under `targets`
+# overrides only the fields it sets, so one file can manage several index
+# families on the same database without repeating the whole configuration.
+#
+# Every target is reconciled in one pass, in file order:
+#   pgvector-index-manager status -c testdata/sample-config-multi.yaml
+#   pgvector-index-manager plan   -c testdata/sample-config-multi.yaml
+#   pgvector-index-manager apply  -c testdata/sample-config-multi.yaml
+#
+# Each target gets its own report file, named after the target
+# (reports/report-active.json, reports/report-premium.json, ...).
+
+# Shared defaults ----------------------------------------------------------
+
+connection:
+  dsn: "postgres://postgres:benchmark@localhost:5432/indexmanager"
+  statement_timeout: 30s
+  lock_timeout: 5s
+
+table:
+  schema: public
+  name: documents
+  vector_column: embedding
+
+index:
+  type: vector       # vector or halfvec
+  metric: cosine     # cosine, l2, ip
+  dimensions: 128    # required; vector max 2000, halfvec max 4000
+  m: 16              # HNSW m parameter (1-100)
+  ef_construction: 64  # HNSW ef_construction parameter (1-1000)
+
+reconcile:
+  ownership_tag: pgvector-index-manager
+  drop_unowned: false
+  build_timeout: 1h
+  grace_period: 5m
+  # continuous and interval are run-level settings; they belong here, not in a
+  # target, because one process polls every target.
+  continuous: false
+  interval: 5m
+
+report:
+  output_dir: ./reports
+  redact_connection: true
+  include_target_details: false
+
+# Targets ------------------------------------------------------------------
+
+targets:
+  # High-selectivity population: rows that are currently active.
+  - name: active
+    index:
+      name: documents_active_idx
+    population:
+      filters:
+        - column: status
+          values: ["active"]
+
+  # Lower-selectivity population with an optional custom ownership tag.
+  # Distinct managed index names isolate the families even with a shared tag.
+  - name: premium
+    index:
+      name: documents_premium_idx
+    population:
+      filters:
+        - column: tier
+          values: ["premium"]
+    reconcile:
+      ownership_tag: pgvector-index-manager-premium
+
+  # An explicit empty filter list selects the whole table, overriding any
+  # population filters added to the shared defaults.
+  - name: whole-table
+    index:
+      name: documents_all_idx
+    population:
+      filters: []
+    report:
+      output_dir: ./reports/whole-table

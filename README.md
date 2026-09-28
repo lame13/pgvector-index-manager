@@ -4,7 +4,7 @@
 
 Safe reconciler for population-specific pgvector HNSW indexes.
 
-pgvector-index-manager inspects, plans, and safely reconciles pgvector HNSW indexes for population-specific workloads. One configuration owns one named index family and may define a partial-index population with safe equality/`IN` filters. Separate configurations can manage other populations on the same table without retiring each other's indexes.
+pgvector-index-manager inspects, plans, and safely reconciles pgvector HNSW indexes for population-specific workloads. Each target owns one named index family and may define a partial-index population with safe equality/`IN` filters. One configuration can manage several targets on the same table without retiring each other's indexes.
 
 ## Quick Start (Docker Compose)
 
@@ -92,7 +92,7 @@ pgvector-index-manager version
 
 ## Configuration
 
-See [`testdata/sample-config.yaml`](testdata/sample-config.yaml) for a fully documented example.
+See [`testdata/sample-config.yaml`](testdata/sample-config.yaml) for a fully documented single-target example and [`testdata/sample-config-multi.yaml`](testdata/sample-config-multi.yaml) for a multi-target one.
 
 ### Key Sections
 
@@ -119,6 +119,58 @@ See [`testdata/sample-config.yaml`](testdata/sample-config.yaml) for a fully doc
 - `interval` — Polling interval in continuous mode.
 
 **report** — Output directory, target label, and privacy controls.
+
+### Multiple Targets
+
+One file can manage several index families. Top-level sections are shared defaults, and every entry under `targets` overrides only the fields it sets:
+
+```yaml
+connection:
+  dsn: "postgres://postgres@localhost:5432/app"
+
+table:
+  schema: public
+  name: documents
+  vector_column: embedding
+
+index:
+  type: vector
+  metric: cosine
+  dimensions: 128
+
+reconcile:
+  build_timeout: 1h
+  grace_period: 5m
+
+targets:
+  - name: active
+    index:
+      name: documents_active_idx
+    population:
+      filters:
+        - column: status
+          values: ["active"]
+
+  - name: premium
+    index:
+      name: documents_premium_idx
+    population:
+      filters:
+        - column: tier
+          values: ["premium"]
+    reconcile:
+      ownership_tag: pgvector-index-manager-premium
+```
+
+- `status` and `plan` inspect every target; `apply` reconciles them. Targets run in file order, and each block of output is labeled with its target name.
+- Targets that share a DSN share one connection pool.
+- Every target writes its own report: a named target produces `report-<name>.json` instead of `report.json`, so one pass never overwrites another target's report. The report label defaults to the target name unless `report.target_label` is set.
+- Target names must be unique ignoring case, so report filenames remain distinct on case-insensitive filesystems.
+- `reconcile.continuous` and `reconcile.interval` are run-level settings. Declare them in the shared section; a single process polls every target, so declaring them inside a target is rejected.
+- Runtime failures are isolated. A blocked or failing target is reported with its name, the remaining targets still run, and one-shot commands exit non-zero on errors. A report-writing failure does not prevent other reports from being written. Invalid configuration still rejects the whole run.
+- Two targets sharing a DSN may not manage the same schema-qualified index name. Use the same DSN string for targets in one database so pool sharing and duplicate detection work consistently.
+- Distinct managed index names isolate families even when their ownership tag is shared; separate ownership tags are optional.
+- Files without a `targets` list keep the single-target behavior exactly, including the `report.json` filename.
 
 ## How It Works
 

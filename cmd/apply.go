@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -8,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lame13/pgvector-index-manager/internal/config"
-	"github.com/lame13/pgvector-index-manager/internal/pg"
 	"github.com/lame13/pgvector-index-manager/internal/reconciler"
 	"github.com/lame13/pgvector-index-manager/internal/report"
 )
@@ -22,6 +22,9 @@ var applyCmd = &cobra.Command{
 Builds replacements concurrently, verifies them, and retires old owned
 indexes only after verification.
 
+A configuration file may declare several targets. Every target is reconciled
+in order; a failure on one target is reported and does not stop the others.
+
 Use --dry-run to see what would be done without making changes.
 
 When reconcile.continuous is enabled in the config, apply runs in a loop
@@ -31,45 +34,55 @@ at the configured interval until interrupted.`,
 			return fmt.Errorf("--config (-c) flag is required")
 		}
 
-		cfg, err := config.Load(CfgFile)
+		configs, err := config.LoadTargets(CfgFile)
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
 
 		ctx := cmd.Context()
-		pool, err := pg.Connect(ctx, cfg.Connection.DSN)
+		targets, closePools, err := connectTargets(ctx, configs)
 		if err != nil {
-			return fmt.Errorf("connecting to PostgreSQL: %w", err)
+			return err
 		}
-		defer pool.Close()
+		defer closePools()
 
 		// Continuous mode
-		if cfg.Reconcile.Continuous && !dryRun {
-			return reconciler.ApplyContinuous(ctx, pool, cfg, func(result *reconciler.ApplyResult) error {
+		if configs[0].Reconcile.Continuous && !dryRun {
+			interval, err := reconciler.ContinuousInterval(configs[0])
+			if err != nil {
+				return err
+			}
+			return reconciler.ApplyAllContinuous(ctx, targets, interval, func(target reconciler.Target, result *reconciler.ApplyResult, _ error) error {
+				printTargetBanner(target.Name)
 				printApplyResult(result)
-				return writeApplyReport(result, cfg)
+				return writeApplyReport(target, result)
 			})
 		}
 
 		// One-shot mode
-		result, applyErr := reconciler.Apply(ctx, pool, cfg, dryRun)
-		if result != nil {
-			printApplyResult(result)
-			if err := writeApplyReport(result, cfg); err != nil {
-				if applyErr != nil {
-					return fmt.Errorf("applying: %v; writing report: %w", applyErr, err)
+		multi := reconciler.ApplyAll(ctx, targets, dryRun)
+		var errs []error
+		for i, item := range multi.Targets {
+			target := targets[i]
+			printTargetBanner(target.Name)
+			if item.Err != nil {
+				errs = append(errs, targetError("applying", target.Name, item.Err))
+			}
+			if item.Result != nil {
+				printApplyResult(item.Result)
+				if err := writeApplyReport(target, item.Result); err != nil {
+					errs = append(errs, targetError("writing report for", target.Name, err))
 				}
-				return fmt.Errorf("writing report: %w", err)
 			}
 		}
-		if applyErr != nil {
-			return fmt.Errorf("applying: %w", applyErr)
+		if err := errors.Join(errs...); err != nil {
+			return err
 		}
-		if result == nil {
+		if len(targets) == 1 && multi.Targets[0].Result == nil {
 			return fmt.Errorf("applying: no result returned")
 		}
 
-		if len(result.Actions) == 0 {
+		if !multi.Changed() {
 			return ErrNothingToApply
 		}
 
@@ -94,7 +107,9 @@ func printApplyResult(result *reconciler.ApplyResult) {
 	}
 	fmt.Println()
 
-	if len(result.Actions) == 0 {
+	if len(result.Actions) == 0 && result.Failed {
+		fmt.Println("  Reconciliation failed before any actions completed.")
+	} else if len(result.Actions) == 0 {
 		fmt.Println("  No changes were needed.")
 	} else {
 		for _, action := range result.Actions {
@@ -126,10 +141,11 @@ func printApplyResult(result *reconciler.ApplyResult) {
 	fmt.Println()
 }
 
-func writeApplyReport(result *reconciler.ApplyResult, cfg *config.Config) error {
+func writeApplyReport(target reconciler.Target, result *reconciler.ApplyResult) error {
+	cfg := target.Config
 	if cfg.Report.OutputDir == "" {
 		return nil
 	}
 	log.Printf("Writing report to %s", cfg.Report.OutputDir)
-	return report.WriteJSON(Version, result, cfg)
+	return report.WriteJSONForTarget(Version, result, cfg, cfg.Name)
 }

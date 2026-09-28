@@ -1,13 +1,13 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"github.com/lame13/pgvector-index-manager/internal/catalog"
 	"github.com/lame13/pgvector-index-manager/internal/config"
-	"github.com/lame13/pgvector-index-manager/internal/pg"
 )
 
 var statusCmd = &cobra.Command{
@@ -15,31 +15,39 @@ var statusCmd = &cobra.Command{
 	Short: "Inspect current pgvector HNSW indexes",
 	Long: `Inspect the current state of pgvector HNSW indexes for the configured
 table. Shows index health, ownership status, and drift from desired
-configuration.`,
+configuration.
+
+A configuration file may declare several targets; status is printed for each
+of them.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if CfgFile == "" {
 			return fmt.Errorf("--config (-c) flag is required")
 		}
 
-		cfg, err := config.Load(CfgFile)
+		configs, err := config.LoadTargets(CfgFile)
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
 
 		ctx := cmd.Context()
-		pool, err := pg.Connect(ctx, cfg.Connection.DSN)
+		targets, closePools, err := connectTargets(ctx, configs)
 		if err != nil {
-			return fmt.Errorf("connecting to PostgreSQL: %w", err)
+			return err
 		}
-		defer pool.Close()
+		defer closePools()
 
-		status, err := catalog.Inspect(ctx, pool, cfg)
-		if err != nil {
-			return fmt.Errorf("inspecting indexes: %w", err)
+		var errs []error
+		for _, target := range targets {
+			printTargetBanner(target.Name)
+			status, err := catalog.Inspect(ctx, target.Pool, target.Config)
+			if err != nil {
+				errs = append(errs, targetError("inspecting indexes", target.Name, err))
+				continue
+			}
+			printStatus(status, target.Config)
 		}
 
-		printStatus(status, cfg)
-		return nil
+		return errors.Join(errs...)
 	},
 }
 

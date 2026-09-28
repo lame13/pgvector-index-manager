@@ -1,12 +1,12 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"github.com/lame13/pgvector-index-manager/internal/config"
-	"github.com/lame13/pgvector-index-manager/internal/pg"
 	"github.com/lame13/pgvector-index-manager/internal/reconciler"
 )
 
@@ -14,31 +14,39 @@ var planCmd = &cobra.Command{
 	Use:   "plan",
 	Short: "Show what index changes would be made",
 	Long: `Inspect the current state and produce a plan of index changes that would
-be made by the apply command. No changes are executed.`,
+be made by the apply command. No changes are executed.
+
+A configuration file may declare several targets; a plan is printed for each
+of them.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if CfgFile == "" {
 			return fmt.Errorf("--config (-c) flag is required")
 		}
 
-		cfg, err := config.Load(CfgFile)
+		configs, err := config.LoadTargets(CfgFile)
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
 
 		ctx := cmd.Context()
-		pool, err := pg.Connect(ctx, cfg.Connection.DSN)
+		targets, closePools, err := connectTargets(ctx, configs)
 		if err != nil {
-			return fmt.Errorf("connecting to PostgreSQL: %w", err)
+			return err
 		}
-		defer pool.Close()
+		defer closePools()
 
-		plan, err := reconciler.Plan(ctx, pool, cfg)
-		if err != nil {
-			return fmt.Errorf("planning: %w", err)
+		var errs []error
+		for _, target := range targets {
+			printTargetBanner(target.Name)
+			plan, err := reconciler.Plan(ctx, target.Pool, target.Config)
+			if err != nil {
+				errs = append(errs, targetError("planning", target.Name, err))
+				continue
+			}
+			printPlan(plan, target.Config)
 		}
 
-		printPlan(plan, cfg)
-		return nil
+		return errors.Join(errs...)
 	},
 }
 

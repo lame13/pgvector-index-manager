@@ -10,7 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Connect opens a connection pool and verifies connectivity.
+// Connect creates a pool. Connectivity is checked by the first operation, so
+// an unavailable database does not prevent other targets from being processed.
 func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -20,11 +21,6 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %w", err)
-	}
-
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("connecting to PostgreSQL: %w", err)
 	}
 
 	return pool, nil

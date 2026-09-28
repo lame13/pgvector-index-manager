@@ -1,13 +1,10 @@
 package config
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -15,10 +12,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
+	// Name identifies the target inside a multi-target configuration file. It
+	// is empty for legacy single-target files. See targets.go.
+	Name       string           `yaml:"-"`
 	Connection ConnectionConfig `yaml:"connection"`
 	Table      TableConfig      `yaml:"table"`
 	Index      IndexConfig      `yaml:"index"`
@@ -91,30 +90,6 @@ type ReportConfig struct {
 	IncludeTargetDetails bool   `yaml:"include_target_details"`
 }
 
-// Load reads and validates a YAML configuration file.
-func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("reading config file: %w", err)
-	}
-
-	cfg := defaultConfig()
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
-	}
-	if err := ensureSingleDocument(decoder); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
-	}
-
-	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
-
-	return cfg, nil
-}
-
 func defaultConfig() *Config {
 	return &Config{
 		Connection: ConnectionConfig{
@@ -142,18 +117,6 @@ func defaultConfig() *Config {
 			RedactConnection: true,
 		},
 	}
-}
-
-func ensureSingleDocument(decoder *yaml.Decoder) error {
-	var extra any
-	err := decoder.Decode(&extra)
-	if err == io.EOF {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("multiple YAML documents are not supported")
 }
 
 func (c *Config) validate() error {

@@ -53,8 +53,15 @@ type JSONSummary struct {
 	Failed       int `json:"failed"`
 }
 
-// WriteJSON produces the privacy-safe JSON report file.
+// WriteJSON produces the privacy-safe JSON report file for a single target.
 func WriteJSON(version string, result *reconciler.ApplyResult, cfg *config.Config) error {
+	return WriteJSONForTarget(version, result, cfg, "")
+}
+
+// WriteJSONForTarget produces the privacy-safe JSON report file for one target
+// of a multi-target run. A non-empty label names the file report-<label>.json so
+// one pass over several targets does not overwrite earlier reports.
+func WriteJSONForTarget(version string, result *reconciler.ApplyResult, cfg *config.Config, label string) error {
 	if err := os.MkdirAll(cfg.Report.OutputDir, 0750); err != nil {
 		return fmt.Errorf("creating output directory: %w", err)
 	}
@@ -114,12 +121,21 @@ func WriteJSON(version string, result *reconciler.ApplyResult, cfg *config.Confi
 		return fmt.Errorf("marshalling report: %w", err)
 	}
 
-	path := filepath.Join(cfg.Report.OutputDir, "report.json")
+	path := filepath.Join(cfg.Report.OutputDir, reportFileName(label))
 	if err := writePrivateFile(path, data); err != nil {
 		return fmt.Errorf("writing JSON report: %w", err)
 	}
 
 	return nil
+}
+
+// reportFileName keeps the historical single-target filename and derives a
+// per-target filename otherwise.
+func reportFileName(label string) string {
+	if label == "" {
+		return "report.json"
+	}
+	return "report-" + label + ".json"
 }
 
 func genericActionDescription(kind reconciler.ActionKind) string {

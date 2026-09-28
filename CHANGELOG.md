@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.2.0] - 2026-09-28
+
+### Added
+
+- Multi-target configuration: one file may declare a `targets` list, and `status`, `plan`, and `apply` reconcile every target in a single pass. Top-level sections act as shared defaults and each target overrides only the fields it sets, so a DSN, table, or reconcile policy can be shared while every managed index family keeps its own index name, population, and ownership tag.
+- Per-target JSON reports. A named target writes `report-<name>.json` instead of `report.json`, so one pass over several targets no longer overwrites earlier reports. Report permissions and privacy defaults are unchanged.
+- `config.LoadTargets` returns one resolved and validated `Config` per target. Legacy single-target files load through the same path.
+- `reconciler.ApplyAll` and `reconciler.ApplyAllContinuous` reconcile several targets in order and isolate failures, so a blocked or failing target does not stop the others.
+- `testdata/sample-config-multi.yaml`, a documented multi-target example.
+
+### Changed
+
+- `apply`, `plan`, and `status` accept multi-target files and label each block of output with its target name. `apply` exits non-zero when any target fails and reports "nothing to apply" only when no target had work.
+- Targets that share a DSN share a single connection pool. Connections open on first use, so an unavailable database does not stop healthy targets or prevent continuous mode from retrying.
+- Continuous mode is a run-level setting: `reconcile.continuous` and `reconcile.interval` belong in the shared section, and declaring them inside a target is rejected with an explicit error.
+- Configuration files without a `targets` list keep their previous behavior, including the `report.json` filename and the single-target exit codes.
+
+### Tests
+
+- Cover shared-default inheritance, per-target overrides including explicit `false` and an explicit empty filter list, and rejection of missing, unsafe, or duplicate target names, duplicate managed index names, and run-level settings declared per target.
+- Add PostgreSQL/pgvector integration coverage for reconciling and repairing independent populations sharing an ownership tag, converging idempotently without retiring a peer family, and isolating a blocked target from a healthy one.
+- Verify per-target report naming and that a multi-target run never overwrites `report.json`.
+- Exercise CLI failure isolation for unavailable databases, missing tables, and unwritable report directories; include these tests in the PostgreSQL CI matrix.
+
+### Fixed
+
+- Continue `status` and `plan` after a target fails, and report every target's error. Continue writing later targets' reports when an earlier report fails.
+- Reject an explicit empty target list instead of accidentally applying the shared defaults as a single target.
+- Reject target names that differ only by case, preventing report overwrites on case-insensitive filesystems.
+- Compare schema and index names separately when detecting duplicates, allowing quoted identifiers containing dots and identical index names on separate DSNs.
+- Return an error for nonpositive continuous polling intervals instead of panicking.
+- Correct examples that implied separate ownership tags were required for independent managed index families.
+
 ## [0.1.1] - 2026-07-19
 
 ### Fixed

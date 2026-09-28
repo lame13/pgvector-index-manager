@@ -247,35 +247,21 @@ func Apply(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, dryRun b
 	return result, nil
 }
 
-// ApplyContinuous reconciles immediately and then at each configured interval.
-// Cancellation is a clean shutdown rather than a runtime failure.
+// ApplyContinuous reconciles one target immediately and then at each configured
+// interval. Cancellation is a clean shutdown rather than a runtime failure.
+// Continuous runs over several targets go through ApplyAllContinuous.
 func ApplyContinuous(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, onResult func(*ApplyResult) error) error {
-	interval, err := time.ParseDuration(cfg.Reconcile.Interval)
+	interval, err := ContinuousInterval(cfg)
 	if err != nil {
-		return fmt.Errorf("parsing interval: %w", err)
+		return err
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	log.Printf("Starting continuous reconciliation (interval: %s)", interval)
-
-	for {
-		result, applyErr := Apply(ctx, pool, cfg, false)
-		if result != nil && onResult != nil && (len(result.Actions) > 0 || result.Failed) {
-			if callbackErr := onResult(result); callbackErr != nil {
-				log.Printf("Reconciliation result handling error: %v", callbackErr)
-			}
-		}
-		if applyErr != nil && !errors.Is(applyErr, context.Canceled) {
-			log.Printf("Reconciliation error: %v", applyErr)
-		}
-
-		select {
-		case <-ctx.Done():
-			log.Printf("Stopping continuous reconciliation")
+	targets := []Target{{Name: cfg.Name, Config: cfg, Pool: pool}}
+	return ApplyAllContinuous(ctx, targets, interval, func(_ Target, result *ApplyResult, _ error) error {
+		if onResult == nil {
 			return nil
-		case <-ticker.C:
 		}
-	}
+		return onResult(result)
+	})
 }
 
 func buildReplacement(ctx context.Context, conn *pgxpool.Conn, pool *pgxpool.Pool, cfg *config.Config, result *ApplyResult) (*catalog.IndexInfo, error) {

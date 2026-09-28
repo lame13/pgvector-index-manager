@@ -76,3 +76,44 @@ func TestWriteJSONUsesPrivatePermissionsAndRedactsConnection(t *testing.T) {
 		t.Fatalf("report did not generalize action description: %s", text)
 	}
 }
+
+func TestWriteJSONForTargetWritesOneFilePerTarget(t *testing.T) {
+	outputDir := t.TempDir()
+	cfg := &config.Config{
+		Connection: config.ConnectionConfig{DSN: "postgres://secret@database"},
+		Index:      config.IndexConfig{Name: "documents_active_idx", Type: "vector", Metric: "cosine", Dimensions: 128},
+		Reconcile:  config.ReconcileConfig{OwnershipTag: "test"},
+		Report: config.ReportConfig{
+			OutputDir:        outputDir,
+			TargetLabel:      "active",
+			RedactConnection: true,
+		},
+	}
+	result := &reconciler.ApplyResult{StartTime: time.Unix(1, 0)}
+
+	if err := os.WriteFile(filepath.Join(outputDir, "report.json"), []byte("legacy report"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"active", "premium"} {
+		cfg.Report.TargetLabel = name
+		if err := WriteJSONForTarget("0.2.0", result, cfg, name); err != nil {
+			t.Fatalf("WriteJSONForTarget(%s) error = %v", name, err)
+		}
+		info, err := os.Stat(filepath.Join(outputDir, "report-"+name+".json"))
+		if err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("report %s must exist with private permissions: %v/%v", name, info, err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(outputDir, "report-active.json"))
+	if err != nil {
+		t.Fatalf("reading per-target report: %v", err)
+	}
+	if !strings.Contains(string(data), `"target": "active"`) {
+		t.Fatalf("per-target report lost its label: %s", data)
+	}
+	data, err = os.ReadFile(filepath.Join(outputDir, "report.json"))
+	if err != nil || string(data) != "legacy report" {
+		t.Fatalf("per-target report overwrote report.json: %q/%v", data, err)
+	}
+}

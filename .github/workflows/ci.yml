@@ -99,4 +99,4 @@ jobs:
       - name: PostgreSQL/pgvector integration tests
         env:
           PGVECTOR_INDEX_MANAGER_TEST_DSN: postgres://postgres:integration@127.0.0.1:5432/indexmanager?sslmode=disable
-        run: go test ./internal/reconciler -run Integration -count=1 -v
+        run: go test ./cmd ./internal/reconciler -run Integration -count=1 -v
