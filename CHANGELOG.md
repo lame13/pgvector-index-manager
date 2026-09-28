@@ -36,6 +36,8 @@ The project uses semantic versioning.
 - Compare schema and index names separately when detecting duplicates, allowing quoted identifiers containing dots and identical index names on separate DSNs.
 - Return an error for nonpositive continuous polling intervals instead of panicking.
 - Correct examples that implied separate ownership tags were required for independent managed index families.
+- Run integration test packages sequentially against their shared CI database to prevent concurrent pgvector extension creation.
+- Require Go 1.26.8 consistently for builds, Docker, and CI, and update `golang.org/x/text` to 0.39.0 to address the vulnerabilities reported by Govulncheck.
 
 ## [0.1.1] - 2026-07-19
 

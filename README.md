@@ -259,7 +259,7 @@ All rows have `status = 'active'` for 100% selectivity filtering.
 ## Requirements
 
 - PostgreSQL 16, 17, or 18 with pgvector 0.8+ installed
-- Go 1.25.12+ (for building from source)
+- Go 1.26.8+ (for building from source)
 
 ## License
 
